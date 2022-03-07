@@ -15,7 +15,7 @@ approvers:
 api-approvers: # in case of new or modified APIs or API extensions (CRDs, aggregated apiservers, webhooks, finalizers)
   - "@deads2k"
 creation-date: 2021-11-05
-last-updated: 2022-03-01
+last-updated: 2022-03-07
 status: implementable
 see-also:
 replaces:
@@ -145,20 +145,25 @@ interval on all backends in a cluster.
 ```go
 type IngressControllerTuningOptions struct {
 ...
-	// healthCheckInterval defines how long the router waits between two consecutive
-	// health checks on its configured backends.  This value is applied globally as
-	// a default for all routes, but may be overridden per-route by the route annotation
-	// "router.openshift.io/haproxy.health.check.interval".
-	//
-	// If unset, the default healthCheckInterval is 5s.
-	//
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Format=duration
-	// +optional
-	HealthCheckInterval *metav1.Duration `json:”healthCheckInterval,omitempty”`
+       // healthCheckInterval defines how long the router waits between two consecutive
+       // health checks on its configured backends.  This value is applied globally as
+       // a default for all routes, but may be overridden per-route by the route annotation
+       // "router.openshift.io/haproxy.health.check.interval".
+       //
+       // Setting this to less than 5s can cause excess traffic due to too frequent TCP health
+       // checks and accompanying SYN packet storms.  Alternatively, setting this too high can
+       // result in increased latency, due to backend servers that are no longer available, but
+       // haven't yet been detected as such.
+       //
+       // If unset, the default healthCheckInterval is 5s.
+       //
+       // +kubebuilder:validation:Optional
+       // +kubebuilder:validation:Format=duration
+       // +optional
+       HealthCheckInterval *metav1.Duration `json:"healthCheckInterval,omitempty"`
 }
 ```
-### Implementation Details/Notes/Constraints [optional]
+### Implementation Details/Notes/Constraints
 
 To expose the `healthCheckInterval` to HAProxy, the environment variable `ROUTER_BACKEND_CHECK_TIMEOUT` will be added
 to the environment in
@@ -167,7 +172,7 @@ to the environment in
 // desiredRouterDeployment returns the desired router deployment.
 func desiredRouterDeployment(ci *operatorv1.IngressController, ingressControllerImage string, ingressConfig *configv1.Ingress, apiConfig *configv1.APIServer, networkConfig *configv1.Network, proxyNeeded bool, haveClientCAConfigmap bool, clientCAConfigmap *corev1.ConfigMap) (*appsv1.Deployment, error) {
 ...
-if ci.Spec.TuningOptions.HealthCheckInterval != nil && ci.Spec.TuningOptions.HealthCheckInterval > 5*time.Second {
+if ci.Spec.TuningOptions.HealthCheckInterval != nil && ci.Spec.TuningOptions.HealthCheckInterval > 0*time.Second {
     env = append(env, corev1.EnvVar{Name: "ROUTER_BACKEND_CHECK_TIMEOUT", 
           Value: durationToHAProxyTimespec(ci.Spec.TuningOptions.HealthCheckInterval)})
 ...
@@ -182,24 +187,25 @@ interval.  For example, backend services that would normally be marked as DOWN w
 period, causing more errors to be seen by their application users.  To mitigate this issue the healthcheck can be
 adjusted to a shorter interval, or set back to the default.
 
-Furthermore, a change to the health check `inter` duration can have an impact on the `timeout connect` for healthchecks,
-which is the maximum time to wait for a connection attempt to succeed.
+Furthermore, a change to the health check interval (`check inter`) can have an impact on the
+the maximum time to wait for a connection attempt to succeed (`timeout connect`) for healthchecks.
 We globally set the `timeout connect` to be 5 seconds by default. (The default can be overridden as environment variable
 `ROUTER_DEFAULT_CONNECT_TIMEOUT` but only with a custom router.)  We also hard-code `timeout check` to 5 seconds and
 apply to the same backend scope as `check inter`.  As
 [documented in the HAProxy configuration manual](http://cbonte.github.io/haproxy-dconv/2.2/configuration.html#4.2-timeout%20check),
 when `timeout check` is set, HAProxy:
->uses min(`timeout connect`, `inter`) as a connect timeout for check and `timeout check` as an additional read timeout
+>uses min(`timeout connect`, `inter`) as a connect timeout for check
 
-This is likely to be a problem only if the `inter` duration was accidentally set to lower than 5 seconds, in which case
-the healthchecks could time out before the expected 5 seconds.  To mitigate this, the validation on the healthcheck
-interval value (`healthCheckInterval`) will have a minimum of 5 seconds.
+This is likely to be a problem only if the `inter` duration is accidentally set to less than 5 seconds, in which case
+the healthchecks could time out before the expected 5 seconds.  The godoc for the `healthCheckInterval` setting has already
+been updated with a warning that setting it to less than 5 seconds will cause other, more serious, problems.
 
 ## Design Details
 
-### Open Questions [optional]
+### Open Questions
 
-Is there ever a reason to allow users to set the healthcheck interval lower than 5 seconds?
+Is there ever a reason to allow users to set the healthcheck interval lower than 5 seconds?  Note added to godoc to
+ensure users know why this is a bad idea.
 
 ### Test Plan
 
@@ -274,6 +280,14 @@ values doesn't fix it, that is evidence of another issue.
 ## Drawbacks
 
 This enhancement is customer-driven and is not proven to have the effects that the customer desires.
+
+Additionally, because the route annotation can override the global healthcheck setting, this enhancement does not provide
+defense against revised healthcheck intervals for individual routes.
+
+Finally, this enhancement serves to obscure the configured healthcheck interval from namespace administrators. There is
+a risk that this will
+prompt them to add route annotations to gain insight into healthcheck intervals, thus duplicating or overriding the
+efforts of the cluster administrator to set a global healthcheck interval for all routes.
 
 ## Alternatives
 
